@@ -18,11 +18,15 @@ Usage:
 
           python sandpile.py -s 1000 -r 50 -c 50 --format png
 
+    * Output to GIF
+
+          python sandpile.py -s 1000 -r 18 -c 18 --format gif
+
     python sandpile.py --help
 
 Dependencies:
 * numpy
-* Pillow (optional) for PNG output format
+* Pillow for PNG and GIF output format
 """
 
 import math
@@ -31,10 +35,12 @@ import random
 import sys
 from argparse import ArgumentParser
 from dataclasses import dataclass
+from itertools import chain
 from time import perf_counter
 from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image, ImagePalette
 
 GRID_ROWS = 10
 GRID_COLUMNS = 10
@@ -49,8 +55,17 @@ class Coords:
 class Board:
     cells: np.ndarray
 
-    def __init__(self, rows: int = GRID_ROWS, columns: int = GRID_COLUMNS):
-        self.cells = np.zeros((rows, columns), dtype=int)
+    def __init__(self, cells: np.array):
+        self.cells = cells
+
+    @classmethod
+    def new(cls, rows: int = GRID_ROWS, columns: int = GRID_COLUMNS):
+        """
+        Create a new board of the specified size, with all
+        cells initialized to zero.
+        """
+        cells = np.zeros((rows, columns), dtype=int)
+        return cls(cells)
 
     def __iter__(self):
         for row in self.cells:
@@ -102,6 +117,9 @@ class Board:
             coords.append(Coords(row=row, column=column))
         return coords
 
+    def copy(self):
+        return self.__class__(cells=self.cells.copy())
+
     def __repr__(self):
         row_count, column_count = self.limits
         return f"{self.__class__.__name__}<{row_count}, {column_count}>"
@@ -117,7 +135,7 @@ class Algorithm:
     topples = 0
 
     def __init__(self, board: Optional[Board] = None):
-        self.board = board if board else Board()
+        self.board = board if board else Board.new()
 
     def step(self):
         """
@@ -180,63 +198,100 @@ class Algorithm:
                 yield neighbor
 
 
-def render_text(board: Board):
+@dataclass
+class Frame:
+    number: int
+    board: Board
+    topples: int
+
+
+def output_text(_, frames: List[Frame]):
     logging.debug("rendering text")
-    print(board)
+    print(frames[-1].board)
 
 
-def render_png(board: Board):
-    SCALE_FACTOR = 5
+# https://www.colourlovers.com/palette/292482/Terra
+COLOR_MAP = {
+    3: (232, 221, 203),
+    2: (205, 179, 128),
+    1: (3, 101, 100),
+    0: (3, 22, 52),
+}
+
+
+def render_png(board: Board) -> Image:
+    SCALE_FACTOR = 10
     logging.debug("rendering PNG")
-    from PIL import Image
-
-    print(board)
-
-    # https://www.colourlovers.com/palette/292482/Terra
-    color_map = {
-        0: (232, 221, 203),
-        1: (205, 179, 128),
-        2: (3, 101, 100),
-        3: (3, 22, 52),
-    }
 
     rows, cols = board.limits
     img_data = np.zeros((rows * SCALE_FACTOR, cols * SCALE_FACTOR, 3), dtype=np.uint8)
     for (row, col), value in np.ndenumerate(board.cells):
         out_row = row * SCALE_FACTOR
         out_col = col * SCALE_FACTOR
-        color = color_map.get(value) or color_map[0]
+        color = COLOR_MAP.get(value) or COLOR_MAP[0]
         for i in range(SCALE_FACTOR):
             for j in range(SCALE_FACTOR):
                 img_data[out_row + i][out_col + j] = color
-    image = Image.fromarray(img_data, "RGB")
-    image.resize((image.width * SCALE_FACTOR, image.height * SCALE_FACTOR))
-    image.save("board.png")
+    return Image.fromarray(img_data, "RGB")
+
+
+def output_png(filename, frames: List[Frame]):
+    board = frames[-1].board
+    image = render_png(board)
+    image.save(f"{filename}.png")
     logging.info("Image saved to board.png")
     print(board)
 
 
-RENDERERS = {
-    "text": render_text,
-    "png": render_png,
+def output_gif(filename, frames: List[Frame]):
+    TOTAL_SECONDS = 20
+    duration = TOTAL_SECONDS * 1000 / len(frames)
+    images = [render_png(frame.board) for frame in frames]
+    first, rest = images[0], images[1:]
+    palette = ImagePalette.ImagePalette(
+        size=len(COLOR_MAP), palette=list(chain(COLOR_MAP.values()))
+    )
+    first.save(
+        f"{filename}.gif",
+        save_all=True,
+        append_images=rest,
+        duration=duration,
+        palette=palette,
+        interlace=True,
+        optimize=False,
+        loop=1,
+    )
+
+
+OUTPUT_FUNCTIONS = {
+    "text": output_text,
+    "png": output_png,
+    "gif": output_gif,
 }
 
 
 def main(steps=10, columns=GRID_COLUMNS, rows=GRID_ROWS, format="text"):
-    board = Board(rows=rows, columns=columns)
+    board = Board.new(rows=rows, columns=columns)
     algo = Algorithm(board=board)
-    render_function = RENDERERS[format]
+    render_function = OUTPUT_FUNCTIONS[format]
+    frames: List[Frame] = []
 
     start = perf_counter()
-    for _ in range(steps):
+    for i in range(steps):
         algo.step()
+        frames.append(Frame(number=i, board=algo.board.copy(), topples=algo.topples))
     end = perf_counter()
 
-    render_function(board)
+    render_start = perf_counter()
+    render_function(f"board_steps_{steps}_rows_{rows}_cols_{columns}", frames)
+    render_end = perf_counter()
 
     print(f"Steps={algo.steps}")
     print(f"Topples={algo.topples}")
     print(f"Seconds={end - start}")
+    render_seconds = render_end - render_start
+    if render_seconds > 1:
+        print(f"Render seconds: {render_seconds}")
 
 
 if __name__ == "__main__":
@@ -245,7 +300,9 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--rows", default=GRID_ROWS, type=int)
     parser.add_argument("-c", "--columns", default=GRID_COLUMNS, type=int)
     parser.add_argument("-l", "--log-level", default="info", type=str)
-    parser.add_argument("-f", "--format", default="text", choices=RENDERERS.keys())
+    parser.add_argument(
+        "-f", "--format", default="text", choices=OUTPUT_FUNCTIONS.keys()
+    )
 
     args = parser.parse_args()
 
