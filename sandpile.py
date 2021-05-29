@@ -36,6 +36,7 @@ import sys
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from itertools import chain
+from multiprocessing import Pool
 from time import perf_counter
 from typing import Iterator, List, Optional, Tuple
 
@@ -246,7 +247,10 @@ def output_png(filename, frames: List[Frame]):
 def output_gif(filename, frames: List[Frame]):
     TOTAL_SECONDS = 20
     duration = TOTAL_SECONDS * 1000 / len(frames)
-    images = [render_png(frame.board) for frame in frames]
+
+    with Pool() as pool:
+        images = pool.map(render_png, [frame.board for frame in frames])
+
     first, rest = images[0], images[1:]
     palette = ImagePalette.ImagePalette(
         size=len(COLOR_MAP), palette=list(chain(COLOR_MAP.values()))
