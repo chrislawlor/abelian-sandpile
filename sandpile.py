@@ -29,16 +29,18 @@ Dependencies:
 * Pillow for PNG and GIF output format
 """
 
-import math
+import argparse
+import json
 import logging
+import math
 import random
-import sys
-from argparse import ArgumentParser
 from dataclasses import dataclass
+from functools import partial
 from itertools import chain
 from multiprocessing import Pool
+from pathlib import Path
 from time import perf_counter
-from typing import Iterator, List, Optional, Tuple
+from typing import Generator, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImagePalette
@@ -60,13 +62,28 @@ class Board:
         self.cells = cells
 
     @classmethod
-    def new(cls, rows: int = GRID_ROWS, columns: int = GRID_COLUMNS):
+    def new(cls, rows: int = GRID_ROWS, columns: int = GRID_COLUMNS) -> "Board":
         """
         Create a new board of the specified size, with all
         cells initialized to zero.
         """
         cells = np.zeros((rows, columns), dtype=int)
         return cls(cells)
+
+    @classmethod
+    def load(cls, stream) -> "Board":
+        """
+        Load a Board from a file-like object.
+        """
+        data = json.loads(stream.read())
+        cells = np.asarray(data)
+        return cls(cells=cells)
+
+    def save(self, stream):
+        """
+        Save a Board to a file-like object.
+        """
+        stream.write(json.dumps([row.tolist() for row in self.cells], indent=2))
 
     def __iter__(self):
         for row in self.cells:
@@ -129,6 +146,12 @@ class Board:
         return repr(self.cells)
 
 
+@dataclass
+class Frame:
+    board: Board
+    topples: int
+
+
 class Algorithm:
     critical_point = 4
     board: Board
@@ -138,7 +161,7 @@ class Algorithm:
     def __init__(self, board: Optional[Board] = None):
         self.board = board if board else Board.new()
 
-    def step(self):
+    def step(self, yield_unstable_frames=False) -> Generator[Frame, None, None]:
         """
         Add sand to random coordinates, and resolve the board
         by toppling any critical cells.
@@ -146,7 +169,7 @@ class Algorithm:
         coords = self.get_random_coords()
         logging.debug("Chose random coords %s", coords)
         self.board.incr(coords)
-        self.resolve()
+        yield from self.resolve(yield_unstable_frames=yield_unstable_frames)
         self.steps += 1
 
     def get_random_coords(self) -> Coords:
@@ -155,7 +178,7 @@ class Algorithm:
         column = math.floor(random.uniform(0, column_count))
         return Coords(row=row, column=column)
 
-    def resolve(self):
+    def resolve(self, yield_unstable_frames=False) -> Generator[Frame, None, None]:
         """
         Topple all critical cells, until the board is stable.
         """
@@ -167,6 +190,10 @@ class Algorithm:
             critical_cells = self.board.get_critical_coords(
                 threshold=self.critical_point
             )
+            if yield_unstable_frames:
+                yield Frame(board=self.board.copy(), topples=self.topples)
+        if not yield_unstable_frames:
+            yield Frame(board=self.board.copy(), topples=self.topples)
 
     def topple_cell(self, coords: Coords):
         """
@@ -198,12 +225,8 @@ class Algorithm:
             if self.board.is_on_board(neighbor):
                 yield neighbor
 
-
-@dataclass
-class Frame:
-    number: int
-    board: Board
-    topples: int
+    def is_stable(self):
+        return not bool(self.board.get_critical_coords(threshold=self.critical_point))
 
 
 def output_text(_, frames: List[Frame]):
@@ -229,7 +252,7 @@ def render_png(board: Board) -> Image:
     for (row, col), value in np.ndenumerate(board.cells):
         out_row = row * SCALE_FACTOR
         out_col = col * SCALE_FACTOR
-        color = COLOR_MAP.get(value) or COLOR_MAP[0]
+        color = COLOR_MAP.get(value) or COLOR_MAP[3]
         for i in range(SCALE_FACTOR):
             for j in range(SCALE_FACTOR):
                 img_data[out_row + i][out_col + j] = color
@@ -247,6 +270,7 @@ def output_png(filename, frames: List[Frame]):
 def output_gif(filename, frames: List[Frame]):
     TOTAL_SECONDS = 20
     duration = TOTAL_SECONDS * 1000 / len(frames)
+    duration = max(duration, 500)
 
     with Pool() as pool:
         images = pool.map(render_png, [frame.board for frame in frames])
@@ -274,19 +298,38 @@ OUTPUT_FUNCTIONS = {
 }
 
 
-def main(steps=10, columns=GRID_COLUMNS, rows=GRID_ROWS, format="text"):
-    board = Board.new(rows=rows, columns=columns)
-    algo = Algorithm(board=board)
-    render_function = OUTPUT_FUNCTIONS[format]
+def run_random_steps(algorithm: Algorithm, steps: int) -> List[Frame]:
     frames: List[Frame] = []
-
-    start = perf_counter()
     for i in range(steps):
-        algo.step()
-        frames.append(Frame(number=i, board=algo.board.copy(), topples=algo.topples))
+        frames.extend(algorithm.step())
+    return frames
+
+
+def run_until_stable(algorithm: Algorithm) -> List[Frame]:
+    frames: List[Frame] = []
+    frames.extend(algorithm.step(yield_unstable_frames=True))
+    return frames
+
+
+def main(
+    steps=10, columns=GRID_COLUMNS, rows=GRID_ROWS, format="text", board_file=None
+):
+    if board_file:
+        board = Board.load(board_file)
+        logging.debug("loaded board: %s", board)
+        run_func = run_until_stable
+    else:
+        board = Board.new(rows=rows, columns=columns)
+        run_func = partial(run_random_steps, steps=steps)
+    algo = Algorithm(board=board)
+    start = perf_counter()
+
+    frames = run_func(algo)
     end = perf_counter()
+    logging.debug("Calculated %s frames", len(frames))
 
     render_start = perf_counter()
+    render_function = OUTPUT_FUNCTIONS[format]
     render_function(f"board_steps_{steps}_rows_{rows}_cols_{columns}", frames)
     render_end = perf_counter()
 
@@ -299,7 +342,7 @@ def main(steps=10, columns=GRID_COLUMNS, rows=GRID_ROWS, format="text"):
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser()
+    parser = argparse.ArgumentParser()
     parser.add_argument("-s", "--steps", default=100, type=int)
     parser.add_argument("-r", "--rows", default=GRID_ROWS, type=int)
     parser.add_argument("-c", "--columns", default=GRID_COLUMNS, type=int)
@@ -307,10 +350,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f", "--format", default="text", choices=OUTPUT_FUNCTIONS.keys()
     )
+    parser.add_argument(
+        "-b",
+        "--board",
+        help="Load a board file and run until stable",
+        type=argparse.FileType("r", encoding="ascii"),
+    )
 
     args = parser.parse_args()
 
     loglevel = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(level=loglevel)
 
-    main(steps=args.steps, rows=args.rows, columns=args.columns, format=args.format)
+    main(
+        steps=args.steps,
+        rows=args.rows,
+        columns=args.columns,
+        format=args.format,
+        board_file=args.board,
+    )
